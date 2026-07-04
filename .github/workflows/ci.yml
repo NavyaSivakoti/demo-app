@@ -1,0 +1,67 @@
+name: CI + AI Pipeline Reviewer
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test-and-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout demo app
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install app dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests (capture output, don't fail yet)
+        id: tests
+        run: |
+          set +e
+          pytest -q --junitxml=results.xml 2>&1 | tee pipeline.log
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Get the AI reviewer agent
+        if: steps.tests.outputs.code != '0'
+        run: |
+          git clone --depth 1 https://github.com/NavyaSivakoti/pipeline-reviewer.git reviewer
+          pip install -r reviewer/requirements.txt
+
+      - name: Run the AI pipeline review
+        if: steps.tests.outputs.code != '0'
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_GENAI_USE_VERTEXAI: "FALSE"
+        run: |
+          python reviewer/ci_review.py "$PWD/results.xml" "$PWD/pipeline.log" | tee review.md
+
+      - name: Post the review as a commit comment
+        if: steps.tests.outputs.code != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = fs.readFileSync('review.md', 'utf8');
+            const body = "## 🤖 AI Pipeline Reviewer\n\n" + review;
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body,
+            });
+
+      - name: Reflect the test failure
+        if: steps.tests.outputs.code != '0'
+        run: |
+          echo "Tests failed — the AI Pipeline Reviewer has commented the review."
+          exit 1
