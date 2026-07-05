@@ -2,21 +2,25 @@ name: CI + AI Pipeline Reviewer
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
+
+# Note: on pull_request from a FORK, secrets (GEMINI_API_KEY) are not available
+# by design, so the review step is skipped. Same-repo branch PRs work fully.
 
 jobs:
   test-and-review:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: write        # needed to post a commit comment
+      pull-requests: write    # needed to post a PR comment
       issues: write
     steps:
       - name: Checkout demo app
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
 
@@ -45,20 +49,28 @@ jobs:
         run: |
           python reviewer/ci_review.py "$PWD/results.xml" "$PWD/pipeline.log" | tee review.md
 
-      - name: Post the review as a commit comment
+      - name: Post the review (PR comment if a PR, else commit comment)
         if: steps.tests.outputs.code != '0'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const fs = require('fs');
-            const review = fs.readFileSync('review.md', 'utf8');
-            const body = "## 🤖 AI Pipeline Reviewer\n\n" + review;
-            await github.rest.repos.createCommitComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              commit_sha: context.sha,
-              body,
-            });
+            const body = "## 🤖 AI Pipeline Reviewer\n\n" + fs.readFileSync('review.md', 'utf8');
+            if (context.payload.pull_request) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            } else {
+              await github.rest.repos.createCommitComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha,
+                body,
+              });
+            }
 
       - name: Reflect the test failure
         if: steps.tests.outputs.code != '0'
