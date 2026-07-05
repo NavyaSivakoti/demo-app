@@ -46,8 +46,16 @@ jobs:
         env:
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_GENAI_USE_VERTEXAI: "FALSE"
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          python reviewer/ci_review.py "$PWD/results.xml" "$PWD/pipeline.log" | tee review.md
+          if [ -n "$PR_NUMBER" ]; then
+            # On a PR: let the agent inspect the changed files (get_pr_changes)
+            python reviewer/ci_review.py --pr "$REPO#$PR_NUMBER" "$PWD/results.xml" "$PWD/pipeline.log" | tee review.md
+          else
+            python reviewer/ci_review.py "$PWD/results.xml" "$PWD/pipeline.log" | tee review.md
+          fi
 
       - name: Post the review (PR comment if a PR, else commit comment)
         if: steps.tests.outputs.code != '0'
