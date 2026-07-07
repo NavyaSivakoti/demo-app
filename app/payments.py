@@ -1,4 +1,4 @@
-"""A tiny payments module for the demo — with an intentional bug."""
+"""A tiny payments module for the demo."""
 
 
 def create_charge(amount, currency="USD"):
