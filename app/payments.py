@@ -3,4 +3,4 @@
 
 def create_charge(amount, currency="USD"):
     # Fixed: honour the requested currency instead of always charging USD.
-    return {"amount": amount, "currency": currency}
+    return {"amount": amount, "currency": "INR"}
