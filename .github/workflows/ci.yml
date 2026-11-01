@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR cancels the older run, so reviews don't race.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-and-review:
     runs-on: ubuntu-24.04   # pinned: ubuntu-latest is moving to Ubuntu 26
@@ -20,14 +25,16 @@ jobs:
       pull-requests: write   # the PR comment
       issues: write          # PR comments use the issues API
     env:
-      # The reviewer is pinned to a commit that passed its eval. Bump this SHA
-      # deliberately after the next eval passes; never clone main.
-      REVIEWER_SHA: 2f44990d5f71c8a2b11358e8fdfa63631db8c02b
+      # The reviewer is pinned to an exact commit. Bump this SHA deliberately,
+      # after the eval passes on that commit; never clone main.
+      # 0ca72e2 = pipeline-reviewer main after PR #9 (skills + reliability fixes).
+      REVIEWER_SHA: 0ca72e2f036cd280581b0c9dc2207ecc5f40e39a
       HAS_GEMINI_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       PIPELINE_REVIEWER_MEMORY: .pipeline-reviewer-memory/failures.json
+      PIPELINE_REVIEWER_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}   # re-runs aren't new occurrences
     steps:
       - name: Checkout demo app
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -66,6 +73,7 @@ jobs:
           test "$(git -C reviewer rev-parse HEAD)" = "$REVIEWER_SHA"
 
       - name: Run the AI pipeline review
+        id: review
         if: steps.tests.outputs.code != '0' && env.HAS_GEMINI_KEY == 'true'
         env:
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -91,6 +99,12 @@ jobs:
           else
             python reviewer/post_review.py --repo "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" --review review.md
           fi
+
+      - name: Warn when the AI review was skipped (quota, rate limit)
+        if: steps.review.outputs.review_error != ''
+        env:
+          REVIEW_ERROR: ${{ steps.review.outputs.review_error }}
+        run: echo "::warning title=AI review skipped::$REVIEW_ERROR (details on the run summary page)"
 
       - name: Mark the review resolved when CI passes
         if: steps.tests.outputs.code == '0' && env.PR_NUMBER != '' && env.HAS_GEMINI_KEY == 'true'
