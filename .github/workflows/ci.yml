@@ -2,27 +2,56 @@ name: CI + AI Pipeline Reviewer
 
 on:
   push:
+    branches: [main]      # PR branches are covered by pull_request (no double runs)
   pull_request:
   workflow_dispatch:
 
-# Note: on pull_request from a FORK, secrets (GEMINI_API_KEY) are not available
-# by design, so the review step is skipped. Same-repo branch PRs work fully.
+# On pull requests from a FORK, secrets (GEMINI_API_KEY) are not available by
+# design, so the review steps are skipped. Same-repo branch PRs work fully.
+
+permissions:
+  contents: read
+
+# A newer push to the same PR cancels the older run, so reviews don't race.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test-and-review:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned: ubuntu-latest is moving to Ubuntu 26
     permissions:
-      contents: write        # needed to post a commit comment
-      pull-requests: write    # needed to post a PR comment
-      issues: write
+      contents: write        # commit comments (pushes to main)
+      pull-requests: write   # the PR comment
+      issues: write          # PR comments use the issues API
+    env:
+      # The reviewer is pinned to an exact commit. Bump this SHA deliberately,
+      # after the eval passes on that commit; never clone main.
+      # 0ca72e2 = pipeline-reviewer main after PR #9 (skills + reliability fixes).
+      REVIEWER_SHA: 0ca72e2f036cd280581b0c9dc2207ecc5f40e39a
+      HAS_GEMINI_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PIPELINE_REVIEWER_MEMORY: .pipeline-reviewer-memory/failures.json
+      PIPELINE_REVIEWER_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}   # re-runs aren't new occurrences
     steps:
       - name: Checkout demo app
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.11'
+
+      - name: Restore the reviewer's recurrence memory
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .pipeline-reviewer-memory
+          key: pipeline-reviewer-memory-${{ github.run_id }}
+          restore-keys: pipeline-reviewer-memory-
 
       - name: Install app dependencies
         run: pip install -r requirements.txt
@@ -35,59 +64,63 @@ jobs:
           echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: Get the AI reviewer agent
-        if: steps.tests.outputs.code != '0'
+      - name: Get the AI reviewer agent (pinned to a commit)
+        if: env.HAS_GEMINI_KEY == 'true'
         run: |
-          git clone --depth 1 https://github.com/NavyaSivakoti/pipeline-reviewer.git reviewer
-          pip install -r reviewer/requirements.txt
+          git init -q reviewer
+          git -C reviewer fetch -q --depth 1 https://github.com/NavyaSivakoti/pipeline-reviewer "$REVIEWER_SHA"
+          git -C reviewer checkout -q FETCH_HEAD
+          test "$(git -C reviewer rev-parse HEAD)" = "$REVIEWER_SHA"
 
       - name: Run the AI pipeline review
-        if: steps.tests.outputs.code != '0'
+        id: review
+        if: steps.tests.outputs.code != '0' && env.HAS_GEMINI_KEY == 'true'
         env:
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_GENAI_USE_VERTEXAI: "FALSE"
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
+        run: |
+          pip install -q -r reviewer/requirements.txt
+          args=("$PWD/results.xml" "$PWD/pipeline.log")
+          if [ -n "$PR_NUMBER" ]; then
+            # On a PR: the agent inspects the changed files (get_pr_changes)
+            args=(--pr "$GITHUB_REPOSITORY#$PR_NUMBER" "${args[@]}")
+          fi
+          python reviewer/ci_review.py --json review.json "${args[@]}" > review.md
+
+      - name: Post or update the review comment (one comment per PR)
+        if: steps.tests.outputs.code != '0' && env.HAS_GEMINI_KEY == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -n "$PR_NUMBER" ]; then
-            # On a PR: let the agent inspect the changed files (get_pr_changes)
-            python reviewer/ci_review.py --pr "$REPO#$PR_NUMBER" "$PWD/results.xml" "$PWD/pipeline.log" | tee review.md
+            python reviewer/post_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+              --review review.md --author "$PR_AUTHOR" --sha "$HEAD_SHA"
           else
-            python reviewer/ci_review.py "$PWD/results.xml" "$PWD/pipeline.log" | tee review.md
+            python reviewer/post_review.py --repo "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" --review review.md
           fi
 
-      - name: Post the review (PR comment if a PR, else commit comment)
-        if: steps.tests.outputs.code != '0'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+      - name: Warn when the AI review was skipped (quota, rate limit)
+        if: steps.review.outputs.review_error != ''
+        env:
+          REVIEW_ERROR: ${{ steps.review.outputs.review_error }}
+        run: echo "::warning title=AI review skipped::$REVIEW_ERROR (details on the run summary page)"
+
+      - name: Mark the review resolved when CI passes
+        if: steps.tests.outputs.code == '0' && env.PR_NUMBER != '' && env.HAS_GEMINI_KEY == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python reviewer/post_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --resolved --sha "$HEAD_SHA"
+
+      - name: Save the reviewer's recurrence memory
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          script: |
-            const fs = require('fs');
-            const review = fs.readFileSync('review.md', 'utf8');
-            const header = "## 🤖 AI Pipeline Reviewer\n\n";
-            if (context.payload.pull_request) {
-              // Tag the real PR author (from the PR payload, not the model) so the
-              // person who opened the PR is notified to fix their failing test.
-              const author = context.payload.pull_request.user.login;
-              const body = header + `cc @${author} — CI failed on your PR. Here's the review:\n\n` + review;
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body,
-              });
-            } else {
-              const body = header + review;
-              await github.rest.repos.createCommitComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: context.sha,
-                body,
-              });
-            }
+          path: .pipeline-reviewer-memory
+          key: pipeline-reviewer-memory-${{ github.run_id }}
 
       - name: Reflect the test failure
         if: steps.tests.outputs.code != '0'
         run: |
-          echo "Tests failed — the AI Pipeline Reviewer has commented the review."
+          echo "Tests failed. The AI Pipeline Reviewer has posted or updated its review comment."
           exit 1
